@@ -28,12 +28,18 @@
   }
 )
 
+(define-map split-recipient-list
+  { split-id: uint }
+  { recipients: (list 20 principal) }
+)
+
 (define-map user-balances
   { user: principal }
   { balance: uint }
 )
 
 (define-data-var next-split-id uint u1)
+(define-data-var temp-recipient principal tx-sender)
 
 (define-read-only (get-split-info (split-id uint))
   (map-get? payment-splits { split-id: split-id })
@@ -51,6 +57,10 @@
   (var-get next-split-id)
 )
 
+(define-read-only (get-split-recipients (split-id uint))
+  (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id })))
+)
+
 (define-public (create-split (name (string-ascii 50)))
   (let
     (
@@ -65,6 +75,10 @@
         created-by: tx-sender,
         total-received: u0
       }
+    )
+    (map-set split-recipient-list
+      { split-id: split-id }
+      { recipients: (list) }
     )
     (var-set next-split-id (+ split-id u1))
     (ok split-id)
@@ -92,6 +106,16 @@
       }
     )
     
+    (let
+      (
+        (current-recipients (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
+      )
+      (map-set split-recipient-list
+        { split-id: split-id }
+        { recipients: (unwrap! (as-max-len? (append current-recipients recipient) u20) err-invalid-recipient) }
+      )
+    )
+    
     (map-set payment-splits
       { split-id: split-id }
       (merge split-info { total-percentage: new-total-percentage })
@@ -99,6 +123,10 @@
     
     (ok true)
   )
+)
+
+(define-private (is-not-target-recipient (current-recipient principal))
+  (not (is-eq current-recipient (var-get temp-recipient)))
 )
 
 (define-public (remove-recipient (split-id uint) (recipient principal))
@@ -111,6 +139,18 @@
     (asserts! (is-eq (get created-by split-info) tx-sender) err-owner-only)
     
     (map-delete split-recipients { split-id: split-id, recipient: recipient })
+    
+    (var-set temp-recipient recipient)
+    (let
+      (
+        (current-recipients (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
+        (updated-recipients (filter is-not-target-recipient current-recipients))
+      )
+      (map-set split-recipient-list
+        { split-id: split-id }
+        { recipients: updated-recipients }
+      )
+    )
     
     (map-set payment-splits
       { split-id: split-id }
@@ -137,7 +177,7 @@
       (merge split-info { total-received: (+ (get total-received split-info) amount) })
     )
     
-    (try! (distribute-payment split-id amount))
+    (unwrap-panic (distribute-payment split-id amount))
     (ok true)
   )
 )
@@ -145,68 +185,47 @@
 (define-private (distribute-payment (split-id uint) (total-amount uint))
   (let
     (
-      (recipients-list (list 
-        (unwrap! (get-recipient-by-index split-id u0) err-no-recipients)
-        (unwrap! (get-recipient-by-index split-id u1) err-no-recipients)
-        (unwrap! (get-recipient-by-index split-id u2) err-no-recipients)
-        (unwrap! (get-recipient-by-index split-id u3) err-no-recipients)
-        (unwrap! (get-recipient-by-index split-id u4) err-no-recipients)
-      ))
+      (recipients-list (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
     )
-    (fold process-recipient-payment recipients-list { split-id: split-id, total-amount: total-amount, success: true })
+    (fold process-recipient-distribution recipients-list { split-id: split-id, total-amount: total-amount, success: true })
     (ok true)
   )
 )
 
-(define-private (get-recipient-by-index (split-id uint) (index uint))
-  (if (is-eq index u0)
-    (some { recipient: contract-owner, percentage: u20 })
-    (if (is-eq index u1)
-      (some { recipient: contract-owner, percentage: u30 })
-      (if (is-eq index u2)
-        (some { recipient: contract-owner, percentage: u25 })
-        (if (is-eq index u3)
-          (some { recipient: contract-owner, percentage: u15 })
-          (if (is-eq index u4)
-            (some { recipient: contract-owner, percentage: u10 })
-            none
-          )
-        )
-      )
-    )
-  )
-)
-
-(define-private (process-recipient-payment 
-  (recipient-data { recipient: principal, percentage: uint })
+(define-private (process-recipient-distribution 
+  (recipient principal)
   (context { split-id: uint, total-amount: uint, success: bool })
 )
   (let
     (
-      (recipient (get recipient recipient-data))
-      (percentage (get percentage recipient-data))
       (split-id (get split-id context))
       (total-amount (get total-amount context))
-      (payment-amount (/ (* total-amount percentage) u100))
-      (current-balance (get-user-balance recipient))
+      (recipient-info (map-get? split-recipients { split-id: split-id, recipient: recipient }))
     )
-    (map-set user-balances
-      { user: recipient }
-      { balance: (+ current-balance payment-amount) }
-    )
-    
-    (match (map-get? split-recipients { split-id: split-id, recipient: recipient })
-      existing-info
-      (map-set split-recipients
-        { split-id: split-id, recipient: recipient }
-        (merge existing-info { total-earned: (+ (get total-earned existing-info) payment-amount) })
+    (match recipient-info
+      info
+      (let
+        (
+          (percentage (get percentage info))
+          (payment-amount (/ (* total-amount percentage) u100))
+          (current-balance (get-user-balance recipient))
+        )
+        (map-set user-balances
+          { user: recipient }
+          { balance: (+ current-balance payment-amount) }
+        )
+        (map-set split-recipients
+          { split-id: split-id, recipient: recipient }
+          (merge info { total-earned: (+ (get total-earned info) payment-amount) })
+        )
       )
       true
     )
-    
     context
   )
 )
+
+
 
 (define-public (withdraw-balance)
   (let
