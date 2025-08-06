@@ -38,8 +38,29 @@
   { balance: uint }
 )
 
+(define-map payment-history
+  { split-id: uint, payment-id: uint }
+  {
+    amount: uint,
+    timestamp: uint,
+    sender: principal,
+    recipient-count: uint
+  }
+)
+
+(define-map split-analytics
+  { split-id: uint }
+  {
+    total-payments: uint,
+    payment-count: uint,
+    largest-payment: uint,
+    last-payment-time: uint
+  }
+)
+
 (define-data-var next-split-id uint u1)
 (define-data-var temp-recipient principal tx-sender)
+(define-data-var next-payment-id uint u1)
 
 (define-read-only (get-split-info (split-id uint))
   (map-get? payment-splits { split-id: split-id })
@@ -61,6 +82,25 @@
   (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id })))
 )
 
+(define-read-only (get-payment-history (split-id uint) (payment-id uint))
+  (map-get? payment-history { split-id: split-id, payment-id: payment-id })
+)
+
+(define-read-only (get-split-analytics (split-id uint))
+  (map-get? split-analytics { split-id: split-id })
+)
+
+(define-read-only (get-average-payment (split-id uint))
+  (match (map-get? split-analytics { split-id: split-id })
+    analytics
+    (if (> (get payment-count analytics) u0)
+      (some (/ (get total-payments analytics) (get payment-count analytics)))
+      (some u0)
+    )
+    none
+  )
+)
+
 (define-public (create-split (name (string-ascii 50)))
   (let
     (
@@ -79,6 +119,15 @@
     (map-set split-recipient-list
       { split-id: split-id }
       { recipients: (list) }
+    )
+    (map-set split-analytics
+      { split-id: split-id }
+      {
+        total-payments: u0,
+        payment-count: u0,
+        largest-payment: u0,
+        last-payment-time: u0
+      }
     )
     (var-set next-split-id (+ split-id u1))
     (ok split-id)
@@ -161,10 +210,47 @@
   )
 )
 
+(define-private (record-payment-history (split-id uint) (amount uint) (recipient-count uint))
+  (let
+    (
+      (payment-id (var-get next-payment-id))
+      (current-analytics (default-to 
+        { total-payments: u0, payment-count: u0, largest-payment: u0, last-payment-time: u0 }
+        (map-get? split-analytics { split-id: split-id })
+      ))
+      (new-total (+ (get total-payments current-analytics) amount))
+      (new-count (+ (get payment-count current-analytics) u1))
+      (new-largest (if (> amount (get largest-payment current-analytics)) amount (get largest-payment current-analytics)))
+    )
+    (map-set payment-history
+      { split-id: split-id, payment-id: payment-id }
+      {
+        amount: amount,
+        timestamp: stacks-block-height,
+        sender: tx-sender,
+        recipient-count: recipient-count
+      }
+    )
+    (map-set split-analytics
+      { split-id: split-id }
+      {
+        total-payments: new-total,
+        payment-count: new-count,
+        largest-payment: new-largest,
+        last-payment-time: stacks-block-height
+      }
+    )
+    (var-set next-payment-id (+ payment-id u1))
+    (ok payment-id)
+  )
+)
+
 (define-public (send-payment (split-id uint) (amount uint))
   (let
     (
       (split-info (unwrap! (map-get? payment-splits { split-id: split-id }) err-not-found))
+      (recipients-list (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
+      (recipient-count (len recipients-list))
     )
     (asserts! (get is-active split-info) err-not-found)
     (asserts! (is-eq (get total-percentage split-info) u100) err-invalid-percentage)
@@ -177,6 +263,7 @@
       (merge split-info { total-received: (+ (get total-received split-info) amount) })
     )
     
+    (unwrap-panic (record-payment-history split-id amount recipient-count))
     (unwrap-panic (distribute-payment split-id amount))
     (ok true)
   )
