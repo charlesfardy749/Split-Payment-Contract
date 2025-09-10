@@ -7,6 +7,8 @@
 (define-constant err-invalid-recipient (err u105))
 (define-constant err-no-recipients (err u106))
 (define-constant err-payment-failed (err u107))
+(define-constant err-schedule-not-ready (err u108))
+(define-constant err-schedule-cancelled (err u109))
 
 (define-map payment-splits
   { split-id: uint }
@@ -58,9 +60,23 @@
   }
 )
 
+(define-map scheduled-payments
+  { schedule-id: uint }
+  {
+    split-id: uint,
+    amount: uint,
+    execute-at-block: uint,
+    created-by: principal,
+    is-active: bool,
+    is-recurring: bool,
+    interval-blocks: uint
+  }
+)
+
 (define-data-var next-split-id uint u1)
 (define-data-var temp-recipient principal tx-sender)
 (define-data-var next-payment-id uint u1)
+(define-data-var next-schedule-id uint u1)
 
 (define-read-only (get-split-info (split-id uint))
   (map-get? payment-splits { split-id: split-id })
@@ -98,6 +114,21 @@
       (some u0)
     )
     none
+  )
+)
+
+(define-read-only (get-scheduled-payment (schedule-id uint))
+  (map-get? scheduled-payments { schedule-id: schedule-id })
+)
+
+(define-read-only (is-schedule-ready (schedule-id uint))
+  (match (map-get? scheduled-payments { schedule-id: schedule-id })
+    schedule
+    (and 
+      (get is-active schedule)
+      (>= stacks-block-height (get execute-at-block schedule))
+    )
+    false
   )
 )
 
@@ -369,6 +400,94 @@
     (map-set payment-splits
       { split-id: split-id }
       (merge split-info { total-percentage: new-total-percentage })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (schedule-payment (split-id uint) (amount uint) (execute-at-block uint) (is-recurring bool) (interval-blocks uint))
+  (let
+    (
+      (schedule-id (var-get next-schedule-id))
+      (split-info (unwrap! (map-get? payment-splits { split-id: split-id }) err-not-found))
+    )
+    (asserts! (get is-active split-info) err-not-found)
+    (asserts! (> execute-at-block stacks-block-height) err-invalid-percentage)
+    (asserts! (> amount u0) err-insufficient-balance)
+    (asserts! (or (not is-recurring) (> interval-blocks u0)) err-invalid-percentage)
+    
+    (map-set scheduled-payments
+      { schedule-id: schedule-id }
+      {
+        split-id: split-id,
+        amount: amount,
+        execute-at-block: execute-at-block,
+        created-by: tx-sender,
+        is-active: true,
+        is-recurring: is-recurring,
+        interval-blocks: interval-blocks
+      }
+    )
+    
+    (var-set next-schedule-id (+ schedule-id u1))
+    (ok schedule-id)
+  )
+)
+
+(define-public (execute-scheduled-payment (schedule-id uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? scheduled-payments { schedule-id: schedule-id }) err-not-found))
+      (split-id (get split-id schedule))
+      (amount (get amount schedule))
+    )
+    (asserts! (get is-active schedule) err-schedule-cancelled)
+    (asserts! (>= stacks-block-height (get execute-at-block schedule)) err-schedule-not-ready)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (let
+      (
+        (split-info (unwrap! (map-get? payment-splits { split-id: split-id }) err-not-found))
+        (recipients-list (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
+        (recipient-count (len recipients-list))
+      )
+      (map-set payment-splits
+        { split-id: split-id }
+        (merge split-info { total-received: (+ (get total-received split-info) amount) })
+      )
+      
+      (unwrap-panic (record-payment-history split-id amount recipient-count))
+      (unwrap-panic (distribute-payment split-id amount))
+    )
+    
+    (if (get is-recurring schedule)
+      (map-set scheduled-payments
+        { schedule-id: schedule-id }
+        (merge schedule { execute-at-block: (+ (get execute-at-block schedule) (get interval-blocks schedule)) })
+      )
+      (map-set scheduled-payments
+        { schedule-id: schedule-id }
+        (merge schedule { is-active: false })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-scheduled-payment (schedule-id uint))
+  (let
+    (
+      (schedule (unwrap! (map-get? scheduled-payments { schedule-id: schedule-id }) err-not-found))
+    )
+    (asserts! (is-eq (get created-by schedule) tx-sender) err-owner-only)
+    (asserts! (get is-active schedule) err-schedule-cancelled)
+    
+    (map-set scheduled-payments
+      { schedule-id: schedule-id }
+      (merge schedule { is-active: false })
     )
     
     (ok true)
