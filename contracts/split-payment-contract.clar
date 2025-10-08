@@ -9,6 +9,9 @@
 (define-constant err-payment-failed (err u107))
 (define-constant err-schedule-not-ready (err u108))
 (define-constant err-schedule-cancelled (err u109))
+(define-constant err-milestone-locked (err u110))
+(define-constant err-not-authorized (err u111))
+(define-constant err-already-approved (err u112))
 
 (define-map payment-splits
   { split-id: uint }
@@ -73,10 +76,27 @@
   }
 )
 
+(define-map payment-milestones
+  { milestone-id: uint }
+  {
+    split-id: uint,
+    amount: uint,
+    funded-amount: uint,
+    description: (string-ascii 100),
+    funder: principal,
+    approver: principal,
+    is-approved: bool,
+    is-released: bool,
+    release-block: uint,
+    requires-approval: bool
+  }
+)
+
 (define-data-var next-split-id uint u1)
 (define-data-var temp-recipient principal tx-sender)
 (define-data-var next-payment-id uint u1)
 (define-data-var next-schedule-id uint u1)
+(define-data-var next-milestone-id uint u1)
 
 (define-read-only (get-split-info (split-id uint))
   (map-get? payment-splits { split-id: split-id })
@@ -127,6 +147,24 @@
     (and 
       (get is-active schedule)
       (>= stacks-block-height (get execute-at-block schedule))
+    )
+    false
+  )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? payment-milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (is-milestone-ready (milestone-id uint))
+  (match (map-get? payment-milestones { milestone-id: milestone-id })
+    milestone
+    (and
+      (not (get is-released milestone))
+      (or
+        (and (get requires-approval milestone) (get is-approved milestone))
+        (and (not (get requires-approval milestone)) (>= stacks-block-height (get release-block milestone)))
+      )
     )
     false
   )
@@ -488,6 +526,118 @@
     (map-set scheduled-payments
       { schedule-id: schedule-id }
       (merge schedule { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-milestone (split-id uint) (amount uint) (description (string-ascii 100)) (approver principal) (release-block uint) (requires-approval bool))
+  (let
+    (
+      (milestone-id (var-get next-milestone-id))
+      (split-info (unwrap! (map-get? payment-splits { split-id: split-id }) err-not-found))
+    )
+    (asserts! (get is-active split-info) err-not-found)
+    (asserts! (> amount u0) err-insufficient-balance)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set payment-milestones
+      { milestone-id: milestone-id }
+      {
+        split-id: split-id,
+        amount: amount,
+        funded-amount: amount,
+        description: description,
+        funder: tx-sender,
+        approver: approver,
+        is-approved: false,
+        is-released: false,
+        release-block: release-block,
+        requires-approval: requires-approval
+      }
+    )
+    
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)
+
+(define-public (approve-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (map-get? payment-milestones { milestone-id: milestone-id }) err-not-found))
+    )
+    (asserts! (is-eq (get approver milestone) tx-sender) err-not-authorized)
+    (asserts! (get requires-approval milestone) err-invalid-percentage)
+    (asserts! (not (get is-approved milestone)) err-already-approved)
+    (asserts! (not (get is-released milestone)) err-milestone-locked)
+    
+    (map-set payment-milestones
+      { milestone-id: milestone-id }
+      (merge milestone { is-approved: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (release-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (map-get? payment-milestones { milestone-id: milestone-id }) err-not-found))
+      (split-id (get split-id milestone))
+      (amount (get funded-amount milestone))
+    )
+    (asserts! (not (get is-released milestone)) err-milestone-locked)
+    (asserts! 
+      (or
+        (and (get requires-approval milestone) (get is-approved milestone))
+        (and (not (get requires-approval milestone)) (>= stacks-block-height (get release-block milestone)))
+      )
+      err-milestone-locked
+    )
+    
+    (let
+      (
+        (split-info (unwrap! (map-get? payment-splits { split-id: split-id }) err-not-found))
+        (recipients-list (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
+        (recipient-count (len recipients-list))
+      )
+      (map-set payment-splits
+        { split-id: split-id }
+        (merge split-info { total-received: (+ (get total-received split-info) amount) })
+      )
+      
+      (unwrap-panic (record-payment-history split-id amount recipient-count))
+      (unwrap-panic (distribute-payment split-id amount))
+    )
+    
+    (map-set payment-milestones
+      { milestone-id: milestone-id }
+      (merge milestone { is-released: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (refund-milestone (milestone-id uint))
+  (let
+    (
+      (milestone (unwrap! (map-get? payment-milestones { milestone-id: milestone-id }) err-not-found))
+      (amount (get funded-amount milestone))
+    )
+    (asserts! (is-eq (get funder milestone) tx-sender) err-not-authorized)
+    (asserts! (not (get is-released milestone)) err-milestone-locked)
+    (asserts! (not (get is-approved milestone)) err-already-approved)
+    
+    (as-contract (try! (stx-transfer? amount tx-sender (get funder milestone))))
+    
+    (map-set payment-milestones
+      { milestone-id: milestone-id }
+      (merge milestone { funded-amount: u0 })
     )
     
     (ok true)
