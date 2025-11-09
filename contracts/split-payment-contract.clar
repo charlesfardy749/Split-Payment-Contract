@@ -382,6 +382,57 @@
 )
 
 
+(define-private (quote-fold 
+  (recipient principal)
+  (ctx { split-id: uint, total-amount: uint, sum: uint, items: (list 20 { recipient: principal, amount: uint }) })
+)
+  (let
+    (
+      (ri (map-get? split-recipients { split-id: (get split-id ctx), recipient: recipient }))
+    )
+    (match ri
+      info
+      (let
+        (
+          (amt (/ (* (get total-amount ctx) (get percentage info)) u100))
+          (new-item { recipient: recipient, amount: amt })
+        )
+        (match (as-max-len? (append (get items ctx) new-item) u20)
+          new-items
+          { split-id: (get split-id ctx), total-amount: (get total-amount ctx), sum: (+ (get sum ctx) amt), items: new-items }
+          { split-id: (get split-id ctx), total-amount: (get total-amount ctx), sum: (get sum ctx), items: (get items ctx) }
+        )
+      )
+      ctx
+    )
+  )
+)
+
+(define-read-only (get-distribution-quote (split-id uint) (total-amount uint))
+  (let
+    (
+      (split-info (map-get? payment-splits { split-id: split-id }))
+    )
+    (match split-info
+      info
+      (if (and (get is-active info) (is-eq (get total-percentage info) u100) (> total-amount u0))
+        (let
+          (
+            (recipients-list (default-to (list) (get recipients (map-get? split-recipient-list { split-id: split-id }))))
+            (initial { split-id: split-id, total-amount: total-amount, sum: u0, items: (list) })
+            (final (fold quote-fold recipients-list initial))
+            (remainder (- total-amount (get sum final)))
+          )
+          (some { recipients: (get items final), remainder: remainder })
+        )
+        none
+      )
+      none
+    )
+  )
+)
+
+
 
 (define-public (withdraw-balance)
   (let
